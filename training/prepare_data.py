@@ -20,6 +20,7 @@ import numpy as np
 
 COMMENT = re.compile(r"\{[^}]*\}")
 MOVENUM = re.compile(r"^\d+\.+$")
+VARIATION = re.compile(r"\([^()]*\)")
 RESULTS = {"1-0", "0-1", "1/2-1/2", "*"}
 
 
@@ -27,11 +28,16 @@ def movetext(pgn):
     i = pgn.find("\n\n")
     body = pgn[i + 2:] if i >= 0 else pgn
     body = COMMENT.sub(" ", body)
+    while "(" in body:                       # side lines, innermost first
+        nb = VARIATION.sub(" ", body)
+        if nb == body:
+            break
+        body = nb
     out = []
     for t in body.split():
-        if MOVENUM.match(t) or t in RESULTS:
+        if MOVENUM.match(t) or t in RESULTS or t.startswith("$"):
             continue
-        t = re.sub(r"^\d+\.+", "", t)
+        t = re.sub(r"^\d+\.+", "", t).rstrip("?!")
         if t:
             out.append(t)
     return out
