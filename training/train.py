@@ -1,6 +1,7 @@
 """Train CorvidNet to predict grandmaster moves (policy) and game results (value).
 
 Resumable: re-running with the same --ckpt continues from the last checkpoint.
+Uses a CUDA GPU when one is available (e.g. on Google Colab), otherwise the CPU.
 """
 import argparse, math, os, time
 
@@ -23,7 +24,8 @@ def load(d, split):
 @torch.no_grad()
 def evaluate(model, val, n=20000, bs=1024):
     model.eval()
-    b, f, m, r = val
+    dev = next(model.parameters()).device
+    b, f, m, r = (t[:n].to(dev) for t in val)
     n = min(n, len(m))
     correct = top5 = 0
     ploss = vloss = 0.0
@@ -60,7 +62,12 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--save-every", type=int, default=300, help="seconds")
     ap.add_argument("--eval-every", type=int, default=2000, help="steps")
+    ap.add_argument("--device", default="auto", help="auto, cpu or cuda")
+    ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    dev = torch.device("cuda" if a.device == "auto" and torch.cuda.is_available() else
+                       ("cpu" if a.device == "auto" else a.device))
+    print("device", dev, flush=True)
     torch.set_num_threads(a.threads)
     torch.manual_seed(0)
     os.makedirs(os.path.dirname(a.ckpt) or ".", exist_ok=True)
@@ -76,13 +83,15 @@ def main():
     if a.init_from and not os.path.exists(a.ckpt):
         init = torch.load(a.init_from, weights_only=False, map_location="cpu")
         a.blocks, a.channels = init["blocks"], init["channels"]
-    model = CorvidNet(a.blocks, a.channels)
+    model = CorvidNet(a.blocks, a.channels).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    step, perm, pos = 0, None, 0
+    step, epoch, pos, perm = 0, 0, 0, None
     if os.path.exists(a.ckpt):
-        ck = torch.load(a.ckpt, weights_only=False)
+        ck = torch.load(a.ckpt, weights_only=False, map_location=dev)
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
-        step, perm, pos = ck["step"], ck["perm"], ck["pos"]
+        step, pos = ck["step"], ck["pos"]
+        epoch = ck.get("epoch", 0)
+        perm = ck.get("perm")          # older checkpoints stored the whole order
         print(f"resumed at step {step:,}", flush=True)
     elif a.init_from:
         model.load_state_dict(init["model"])
@@ -90,9 +99,11 @@ def main():
         print("  start val", {k: round(v, 4) for k, v in evaluate(model, val).items()}, flush=True)
         if extra_val:
             print("  start extra val", {k: round(v, 4) for k, v in evaluate(model, extra_val).items()}, flush=True)
-    g = torch.Generator().manual_seed(step)
-    if perm is None:
-        perm = torch.randperm(N, generator=g)
+    def order(e):
+        # the shuffle order for epoch e is rebuilt from a seed, so checkpoints stay small
+        return torch.randperm(N, generator=torch.Generator().manual_seed(a.seed * 100003 + e))
+    if perm is None or len(perm) != N:
+        perm = order(epoch)
 
     def lr_at(s):
         warm = a.warmup
@@ -102,7 +113,7 @@ def main():
 
     def save():
         tmp = a.ckpt + ".tmp"
-        torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step, perm=perm, pos=pos,
+        torch.save(dict(model=model.state_dict(), opt=opt.state_dict(), step=step, epoch=epoch, pos=pos,
                         blocks=a.blocks, channels=a.channels), tmp)
         os.replace(tmp, a.ckpt)
 
@@ -110,9 +121,10 @@ def main():
     run_loss = run_acc = None
     while step < total_steps:
         if pos + a.bs > N:
-            perm, pos = torch.randperm(N, generator=g), 0
+            epoch, pos = epoch + 1, 0
+            perm = order(epoch)
         idx = perm[pos:pos + a.bs]; pos += a.bs
-        b, f, m, r = (t[idx] for t in train)
+        b, f, m, r = (t[idx].to(dev, non_blocking=True) for t in train)
         for pg in opt.param_groups:
             pg["lr"] = lr_at(step)
         p, v = model(planes_from_packed(b, f))

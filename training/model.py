@@ -61,16 +61,16 @@ class CorvidNet(nn.Module):
 def planes_from_packed(board, flags):
     """board: B x 64 uint8 (0 empty, 1-6 own P..K, 7-12 opp P..K), square a1=0.
     flags: B x 2 uint8 -> [castling bits (own K,own Q,opp K,opp Q), ep square+1 or 0]."""
-    B = board.shape[0]
+    B, dev = board.shape[0], board.device
     b = board.long()
-    x = torch.zeros(B, 13, 64)
+    x = torch.zeros(B, 13, 64, device=dev)
     x.scatter_(1, b.unsqueeze(1), 1.0)
     x = x[:, 1:]                                   # drop "empty"
     cast = flags[:, 0].long()
     cp = torch.stack([((cast >> i) & 1).float() for i in range(4)], 1)  # B x 4
     cp = cp.unsqueeze(2).expand(B, 4, 64)
-    ep = torch.zeros(B, 1, 65)
+    ep = torch.zeros(B, 1, 65, device=dev)
     ep.scatter_(2, flags[:, 1].long().view(B, 1, 1), 1.0)
     ep = ep[:, :, 1:]
-    one = torch.ones(B, 1, 64)
+    one = torch.ones(B, 1, 64, device=dev)
     return torch.cat([x, cp, ep, one], 1).view(B, N_PLANES, 8, 8)
