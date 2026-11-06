@@ -49,6 +49,11 @@ def main():
     ap.add_argument("--blocks", type=int, default=6)
     ap.add_argument("--channels", type=int, default=64)
     ap.add_argument("--positions", type=float, default=25e6, help="total training positions")
+    ap.add_argument("--epochs", type=float, default=0, help="if set, overrides --positions as passes over the data")
+    ap.add_argument("--init-from", default="", help="start from this checkpoint's weights (fresh optimizer), "
+                    "e.g. to fine-tune the Chess.com model on Lichess broadcast games")
+    ap.add_argument("--extra-val", default="", help="another data dir whose val split is also reported")
+    ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--bs", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--value-weight", type=float, default=0.25)
@@ -61,10 +66,16 @@ def main():
     os.makedirs(os.path.dirname(a.ckpt) or ".", exist_ok=True)
 
     train, val = load(a.data, "train"), load(a.data, "val")
+    extra_val = load(a.extra_val, "val") if a.extra_val else None
     N = len(train[2])
+    if a.epochs:
+        a.positions = a.epochs * N
     total_steps = int(a.positions // a.bs)
     print(f"train positions {N:,}  val {len(val[2]):,}  steps {total_steps:,}", flush=True)
 
+    if a.init_from and not os.path.exists(a.ckpt):
+        init = torch.load(a.init_from, weights_only=False, map_location="cpu")
+        a.blocks, a.channels = init["blocks"], init["channels"]
     model = CorvidNet(a.blocks, a.channels)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     step, perm, pos = 0, None, 0
@@ -73,12 +84,18 @@ def main():
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
         step, perm, pos = ck["step"], ck["perm"], ck["pos"]
         print(f"resumed at step {step:,}", flush=True)
+    elif a.init_from:
+        model.load_state_dict(init["model"])
+        print(f"initialised from {a.init_from}", flush=True)
+        print("  start val", {k: round(v, 4) for k, v in evaluate(model, val).items()}, flush=True)
+        if extra_val:
+            print("  start extra val", {k: round(v, 4) for k, v in evaluate(model, extra_val).items()}, flush=True)
     g = torch.Generator().manual_seed(step)
     if perm is None:
         perm = torch.randperm(N, generator=g)
 
     def lr_at(s):
-        warm = 1000
+        warm = a.warmup
         if s < warm:
             return a.lr * s / warm
         return a.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, (s - warm) / max(1, total_steps - warm))))
@@ -90,7 +107,7 @@ def main():
         os.replace(tmp, a.ckpt)
 
     t0 = last_save = time.time()
-    run_loss = run_acc = 0.0
+    run_loss = run_acc = None
     while step < total_steps:
         if pos + a.bs > N:
             perm, pos = torch.randperm(N, generator=g), 0
@@ -105,14 +122,17 @@ def main():
         loss.backward()
         opt.step()
         step += 1
-        run_loss = 0.98 * run_loss + 0.02 * lp.item() if step > 1 else lp.item()
-        run_acc = 0.98 * run_acc + 0.02 * (p.argmax(1) == m).float().mean().item()
+        acc = (p.argmax(1) == m).float().mean().item()
+        run_loss = lp.item() if run_loss is None else 0.98 * run_loss + 0.02 * lp.item()
+        run_acc = acc if run_acc is None else 0.98 * run_acc + 0.02 * acc
         if step % 200 == 0:
             el = time.time() - t0
             print(f"step {step:,}/{total_steps:,}  loss {run_loss:.3f}  acc {run_acc:.3f}  "
                   f"lr {lr_at(step):.2e}  {el/3600:.2f}h", flush=True)
         if step % a.eval_every == 0 or step == total_steps:
             print("  val", {k: round(v, 4) for k, v in evaluate(model, val).items()}, flush=True)
+            if extra_val:
+                print("  extra val", {k: round(v, 4) for k, v in evaluate(model, extra_val).items()}, flush=True)
         if time.time() - last_save > a.save_every:
             save(); last_save = time.time()
     save()
